@@ -4,133 +4,200 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IPrediction} from "./interfaces/IPrediction.sol";
+import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
+import {IVault} from "./interfaces/IVault.sol";
 import "fhevm/lib/TFHE.sol";
 import "fhevm/config/ZamaFHEVMConfig.sol";
 
-contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig {
+contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPrediction {
     using SafeERC20 for IERC20;
     using TFHE for ebool;
     using TFHE for euint256;
 
-    event Betted(address indexed user, address indexed token, uint256 indexed roundId, uint256 amount);
-    event RoundClosed(address indexed token, uint256 roundId, uint256 closedPrice);
-
     struct Round {
         uint256 lockPrice;
-        uint256 closedPrice;
+        uint256 closePrice;
         uint256 startTime;
+        uint256 lockTime;
         uint256 closeTime;
-        euint256 totalAmount;
-        euint256 bullAmount;
-        mapping(address user => ebool) betBull;
-        mapping(address user => euint256) amounts;
+        uint256 totalAmount;
+        euint256 ebullAmount; // Encrypted bull amount
+        uint256 bullAmount; // Decrypted bull amount
+        bool isGenesis;
     }
 
-    struct PoolInfo {
-        address priceFeed;
-        uint256 minBetAmount;
-        bool isActive;
+    struct RoundUserInfo {
+        ebool betBull;
+        euint256 amount;
+        bool claimed;
     }
 
-    address constant NATIVE_TOKEN = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
-    uint256 constant ROUND_TIME = 5 minutes;
+    uint256 constant MIN_ROUND_INTERVAL = 1 minutes;
+    IERC20 immutable public override TOKEN;
+    address public immutable VAULT;
 
-    mapping(address token => PoolInfo) public poolInfo;
-    mapping(address token => uint256) public currentRoundId;
-    mapping(address token => Round[]) public rounds;
+    IPriceOracle public priceOracle;
+    uint256 public minBetAmount;
+    uint256 public roundInterval;
+    uint256 public bufferInterval;
 
-    constructor() Ownable(msg.sender) {}
+    uint64 public currentRoundId;  // Current round to bet
+    mapping(uint64 roundId => Round) public rounds;
 
-    function bet(address token, uint256 amount, ebool bull) external {
-        address _token = token;
-        _onlyValidPool(_token);
-        if (poolInfo[_token].minBetAmount > amount || amount == 0) revert InvalidBetAmount();
+    mapping(uint64 roundId => mapping(address user => RoundUserInfo)) public userInfo;
 
-        uint256 _currentRoundId = currentRoundId[_token];
+    constructor(address token) Ownable(IVault(msg.sender).owner()) {
+        if (token == address(0)) revert ZeroAddress();
+        TOKEN = IERC20(token);
+        VAULT = msg.sender;
 
-        Round storage currentRound = rounds[_token][_currentRoundId];
+        _pause();
+    }
+
+    function bet(uint256 amount, ebool bull) external override {
+        _requireValidConfig();
+
+        if (amount < minBetAmount) revert InvalidBetAmount();
+
+        uint64 _currentRoundId = currentRoundId;
+
+        Round memory _currentRound = rounds[_currentRoundId];
+        if (block.timestamp >= _currentRound.lockTime) revert RoundAlreadyLocked();
+        if (_currentRound.isGenesis) revert IsGenesisRound();
+
+        RoundUserInfo storage _userInfo = userInfo[_currentRoundId][msg.sender];
         
-        if (currentRound.betBull[msg.sender].isInitialized()) revert AlreadyBet();
+        if (_userInfo.betBull.isInitialized()) revert AlreadyBet();
 
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), amount);
+        TOKEN.safeTransferFrom(msg.sender, VAULT, amount);
 
         euint256 _amount = TFHE.asEuint256(amount);
 
-        currentRound.totalAmount = currentRound.totalAmount.add(_amount);
-        currentRound.bullAmount = currentRound.bullAmount.add(TFHE.select(bull, _amount, TFHE.asEuint256(0)));
-        currentRound.amounts[msg.sender] = _amount;
-        currentRound.betBull[msg.sender] = bull;
+        _currentRound.totalAmount = _currentRound.totalAmount + amount;
+        _currentRound.ebullAmount = _currentRound.ebullAmount.add(TFHE.select(bull, _amount, TFHE.asEuint256(0)));
 
-        _amount.allow(msg.sender);
+        rounds[_currentRoundId] = _currentRound;
 
-        emit Betted(msg.sender, _token, _currentRoundId, amount);
+        _userInfo.amount = _amount;
+        _userInfo.betBull = bull;
+
+        emit Betted(msg.sender, _currentRoundId, amount);
     }
 
-    function nextRound(address token) external {
-        address _token = token;
-        _onlyValidPool(_token);
-
-        uint256 _currentRoundId = currentRoundId[_token];
-        Round storage currentRound = rounds[_token][_currentRoundId];
-
-        if (block.timestamp < currentRound.startTime + ROUND_TIME) revert NotReadyToClose();
-        if (currentRound.closedPrice != 0) revert AlreadyClosed();
-
-        uint256 _price = getCurrentPrice(_token);
-        currentRound.closedPrice = _price;
-        currentRound.closeTime = block.timestamp;
-
-        emit RoundClosed(_token, currentRoundId[_token] ++, _price);
+    function claim(uint64 roundId) external {
+        if (_claim(roundId) == false) revert UnableToClaim(msg.sender, roundId);
     }
 
-    function getCurrentPrice(address token) public view returns (uint256 price) {
-        address priceFeed = poolInfo[token].priceFeed;
-
-        // TODO: check price
-        (
-            /* uint80 roundId */,
-            int256 answer,
-            /*uint256 startedAt*/,
-            /*uint256 updatedAt*/,
-            /*uint80 answeredInRound*/
-        ) = AggregatorV3Interface(priceFeed).latestRoundData();
-
-        if (answer < 0) revert InvalidPrice();
-
-        price = uint256(answer);
+    function claimInBatch(uint64[] memory roundIds) external {
+        uint256 len = roundIds.length;
+        for (uint256 i; i < len; i += 1) {
+            _claim(roundIds[roundIds[i]]);
+        }
     }
 
-    function setPoolPriceFeed(address token, address priceFeed) external onlyOwner {
-        if (token == address(0)) revert ZeroAddress();
+    function executeNextRound() external {
+        _requireValidConfig();
 
-        poolInfo[token].priceFeed = priceFeed;
+        uint64 _currentRoundId = currentRoundId;
 
-        emit PriceFeedSet(token, priceFeed);
+        Round memory _currentRound = rounds[_currentRoundId];
+
+        if (_currentRound.lockTime != 0 && block.timestamp < _currentRound.lockTime) revert RoundNotReadyToLock();
+
+        uint256 _price = getCurrentPrice();
+
+        if (_currentRound.isGenesis == false) {
+            uint64 _prevRoundId = _currentRoundId - 1;
+            rounds[_prevRoundId].closePrice = _price;
+            rounds[_prevRoundId].ebullAmount.allowThis();
+
+            emit RoundClosed(_prevRoundId, _price);
+        }
+
+        rounds[_currentRoundId].lockPrice = _price;
+        emit RoundLocked(_currentRoundId, _price);
+
+        _startNewRound(false);
     }
 
-    function setPoolMinBetAmount(address token, uint256 minBetAmount) external onlyOwner {
-        poolInfo[token].minBetAmount = minBetAmount;
+    function getCurrentPrice() public override view returns (uint256 price) {
+        price = priceOracle.getCurrentPrice(address(TOKEN));
     }
 
-    function setPoolActive(address token, bool isActive) external onlyOwner {
-        poolInfo[token].isActive = isActive;
+    function setPriceOracle(address _priceOracle) external onlyOwner {
+        _requirePaused();
+
+        // Query price once to valid oracle
+        IPriceOracle(_priceOracle).getCurrentPrice(address(TOKEN));
+
+        priceOracle = IPriceOracle(_priceOracle);
+
+        emit PriceOracleSet(_priceOracle);
     }
 
-    function _onlyValidPool(address token) internal view {
-        PoolInfo memory pool = poolInfo[token];
-        if (pool.priceFeed == address(0)) revert PoolNoOracle();
-        if (pool.isActive == false) revert PoolNotActive();
+    function setMinBetAmount(uint256 _minBetAmount) external onlyOwner {
+        _requirePaused();
+
+        if (_minBetAmount == 0) revert ZeroAmount();
+
+        minBetAmount = _minBetAmount;
     }
 
-    error ZeroAddress();
-    error AlreadyBet();
-    error PoolNoOracle();
-    error PoolNotActive();
-    error InvalidBetAmount();
-    error InvalidPrice();
-    error AlreadyClosed();
-    error NotReadyToClose();
+    function setRoundInterval(uint256 _roundInterval) external onlyOwner {
+        _requirePaused();
 
-    event PriceFeedSet(address indexed token, address indexed priceFeed);
+        if (_roundInterval < MIN_ROUND_INTERVAL) revert InvalidRoundInterval();
+
+        roundInterval = _roundInterval;
+    }
+
+    function unpause() external onlyOwner {
+        _requirePaused();
+        if (address(priceOracle) == address(0)) revert NoPriceOracle();
+        if (minBetAmount == 0) revert NoMinBetAmount();
+        if (roundInterval == 0) revert NoRoundInterval();
+        if (bufferInterval == 0) revert NoBufferInterval();
+
+        _unpause();
+        _startNewRound(true);
+    }
+
+    function pause() external onlyOwner {
+        _requireNotPaused();
+
+        _pause();
+    }
+    
+    function _startNewRound(bool isGenesis) internal {
+        uint64 _nextRoundId = currentRoundId + 1;
+
+        Round storage _nextRound = rounds[_nextRoundId];
+        _nextRound.startTime = block.timestamp;
+        _nextRound.lockTime = block.timestamp + roundInterval;
+        _nextRound.closeTime = block.timestamp + roundInterval * 2;
+        _nextRound.isGenesis = isGenesis;
+
+        currentRoundId = _nextRoundId;
+
+        emit RoundStarted(_nextRoundId, isGenesis);
+    }
+    
+    function _claim(uint64 roundId) public returns (bool success) {
+        Round memory _roundInfo = rounds[roundId];
+        RoundUserInfo memory _userInfo = userInfo[roundId][msg.sender];
+        if (_roundInfo.lockPrice == 0 || _roundInfo.closePrice == 0 || _userInfo.claimed) success = false;
+        else {
+            
+        }
+    }
+
+    function _requireValidConfig() internal view {
+        _requireNotPaused();
+        if (address(priceOracle) == address(0)) revert NoPriceOracle();
+        if (minBetAmount == 0) revert NoMinBetAmount();
+        if (roundInterval == 0) revert NoRoundInterval();
+        if (bufferInterval == 0) revert NoBufferInterval();
+    }    
 }
