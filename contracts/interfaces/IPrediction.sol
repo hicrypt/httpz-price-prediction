@@ -35,4 +35,5 @@ interface IPrediction {
     error ZeroAmount();
     error InvalidRoundInterval();
     error UnableToClaim(address user, uint64 roundId);
+    error DecryptionError();
 }

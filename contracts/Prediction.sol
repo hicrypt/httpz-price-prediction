@@ -10,8 +10,9 @@ import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {IVault} from "./interfaces/IVault.sol";
 import "fhevm/lib/TFHE.sol";
 import "fhevm/config/ZamaFHEVMConfig.sol";
+import "fhevm/gateway/GatewayCaller.sol";
 
-contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPrediction {
+contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, GatewayCaller, Pausable, IPrediction {
     using SafeERC20 for IERC20;
     using TFHE for ebool;
     using TFHE for euint256;
@@ -23,8 +24,7 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
         uint256 lockTime;
         uint256 closeTime;
         uint256 totalAmount;
-        euint256 ebullAmount; // Encrypted bull amount
-        uint256 bullAmount; // Decrypted bull amount
+        euint256 bullAmount;
         bool isGenesis;
     }
 
@@ -32,6 +32,11 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
         ebool betBull;
         euint256 amount;
         bool claimed;
+    }
+
+    struct DecryptRequest {
+        uint64 roundId;
+        address user;
     }
 
     uint256 constant MIN_ROUND_INTERVAL = 1 minutes;
@@ -47,6 +52,8 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
     mapping(uint64 roundId => Round) public rounds;
 
     mapping(uint64 roundId => mapping(address user => RoundUserInfo)) public userInfo;
+
+    mapping(uint256 requestId => DecryptRequest) public decryptRequests;
 
     constructor(address token) Ownable(IVault(msg.sender).owner()) {
         if (token == address(0)) revert ZeroAddress();
@@ -76,7 +83,7 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
         euint256 _amount = TFHE.asEuint256(amount);
 
         _currentRound.totalAmount = _currentRound.totalAmount + amount;
-        _currentRound.ebullAmount = _currentRound.ebullAmount.add(TFHE.select(bull, _amount, TFHE.asEuint256(0)));
+        _currentRound.bullAmount = _currentRound.bullAmount.add(TFHE.select(bull, _amount, TFHE.asEuint256(0)));
 
         rounds[_currentRoundId] = _currentRound;
 
@@ -111,7 +118,7 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
         if (_currentRound.isGenesis == false) {
             uint64 _prevRoundId = _currentRoundId - 1;
             rounds[_prevRoundId].closePrice = _price;
-            rounds[_prevRoundId].ebullAmount.allowThis();
+            rounds[_prevRoundId].bullAmount.allowThis();
 
             emit RoundClosed(_prevRoundId, _price);
         }
@@ -187,10 +194,67 @@ contract Prediction is Ownable2Step, SepoliaZamaFHEVMConfig, Pausable, IPredicti
     function _claim(uint64 roundId) public returns (bool success) {
         Round memory _roundInfo = rounds[roundId];
         RoundUserInfo memory _userInfo = userInfo[roundId][msg.sender];
-        if (_roundInfo.lockPrice == 0 || _roundInfo.closePrice == 0 || _userInfo.claimed) success = false;
-        else {
-            
+        if (_userInfo.claimed) success = false;
+        else if ((_roundInfo.lockPrice == 0 || _roundInfo.closePrice == 0) && block.timestamp < _roundInfo.closeTime + bufferInterval) {
+            success = false;
+        } else {
+            _requestDecryption(roundId, msg.sender);
         }
+    }
+
+    function _requestDecryption(uint64 roundId, address user) internal {
+        Round memory _roundInfo = rounds[roundId];
+        RoundUserInfo memory _userInfo = userInfo[roundId][user];
+
+        _userInfo.amount.allowThis();
+        _userInfo.betBull.allowThis();
+
+        uint256[] memory cts = new uint256[](3);
+        cts[0] = Gateway.toUint256(_roundInfo.bullAmount);
+        cts[0] = Gateway.toUint256(_userInfo.amount);
+        cts[0] = Gateway.toUint256(_userInfo.betBull);
+
+        uint256 requestId = Gateway.requestDecryption(cts, this.callbackDecryptedValues.selector, 0, block.timestamp + 100, false);
+
+        decryptRequests[requestId] = DecryptRequest({
+            roundId: roundId,
+            user: user
+        });
+    }
+
+    function callbackDecryptedValues(uint256 requestId, uint256 bullAmount, uint256 betAmount, bool betBull) external onlyGateway {
+        DecryptRequest memory request = decryptRequests[requestId];
+
+        if (request.user == address(0)) revert DecryptionError();
+
+        Round memory _roundInfo = rounds[request.roundId];
+        RoundUserInfo memory _userInfo = userInfo[request.roundId][request.user];
+
+        if (_userInfo.claimed == false) {
+            uint256 claimAmount;
+            if ((_roundInfo.lockPrice == 0 || _roundInfo.closePrice == 0) && block.timestamp >= _roundInfo.closeTime + bufferInterval) {
+                // Refund after buffer intervals
+                claimAmount = betAmount;
+            }
+            if (_roundInfo.lockPrice < _roundInfo.closePrice && betBull) {
+                claimAmount = _roundInfo.totalAmount * betAmount / bullAmount;
+            } else if (_roundInfo.lockPrice > _roundInfo.closePrice && betBull == false) {
+                claimAmount = _roundInfo.totalAmount * betAmount / (_roundInfo.totalAmount - bullAmount);
+            } else if (_roundInfo.lockPrice == _roundInfo.closePrice) {
+                claimAmount = betAmount;
+            }
+
+            if (claimAmount != 0) {
+                IVault(VAULT).withdrawTokenToUser(address(TOKEN), request.user, claimAmount);
+            }
+
+            // Set claimed to true even claimAmount is 0 to avoid re-decryption.
+            userInfo[request.roundId][request.user].claimed = true;
+        } else {
+            // Do not revert to delete multiple requests for same round id and user
+        }
+
+        delete decryptRequests[requestId];
     }
 
     function _requireValidConfig() internal view {

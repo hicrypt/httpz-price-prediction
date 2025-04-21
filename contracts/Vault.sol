@@ -29,6 +29,12 @@ contract Vault is Ownable2Step, IVault {
         emit PredictionCreated(_token, address(_prediction));
     }
 
+    function withdrawTokenToUser(address token, address user, uint256 amount) external override {
+        if (msg.sender != address(predictions[token])) revert Unauthorized();
+
+        IERC20(token).safeTransfer(user, amount);
+    }
+
     function owner() public view override(Ownable, IVault) returns (address) {
         return super.owner();
     }
